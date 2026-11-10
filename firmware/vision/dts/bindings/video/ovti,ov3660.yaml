@@ -1,0 +1,3 @@
+description: OmniVision OV3660 DVP image sensor
+compatible: "ovti,ov3660"
+include: i2c-device.yaml
