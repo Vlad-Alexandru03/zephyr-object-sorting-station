@@ -33,7 +33,26 @@ static const struct video_format_cap ov3660_formats[] = {
 		.height_min = OV3660_FRAME_SIZE,
 		.height_max = OV3660_FRAME_SIZE,
 	},
+	 {
+        .pixelformat = VIDEO_PIX_FMT_JPEG,
+        .width_min = 320,
+        .width_max = 320,
+        .height_min = 240,
+        .height_max = 240,
+    },
+	  {
+        .pixelformat = VIDEO_PIX_FMT_JPEG,
+        .width_min = 2048,
+        .width_max = 2048,
+        .height_min = 1536,
+        .height_max = 1536,
+    },
 	{},
+};
+
+struct ov3660_data {
+    struct video_format format;
+    bool format_valid;
 };
 
 static int ov3660_read(const struct i2c_dt_spec *bus, uint16_t reg, uint8_t *value)
@@ -92,7 +111,6 @@ int ov3660_test_vsync_pin(const struct device *sensor, const struct device *gpio
 		return ret;
 	}
 
-	/* Route a known low and high level onto the sensor's VSYNC output. */
 	ret = ov3660_write(bus, pad_value_reg, value & ~vsync_pad);
 	if (ret == 0) {
 		ret = ov3660_write(bus, pad_select_reg, selection | vsync_pad);
@@ -166,33 +184,123 @@ static int ov3660_init(const struct device *dev)
 		return ret;
 	}
 
-	k_msleep(10);
-	LOG_INF("OV3660 initialized (PID 0x%04x)", pid);
-	return 0;
+	struct ov3660_data *data = dev->data;
+
+    data->format = (struct video_format) {
+        .type = VIDEO_BUF_TYPE_OUTPUT,
+        .pixelformat = VIDEO_PIX_FMT_RGB565,
+        .width = OV3660_FRAME_SIZE,
+        .height = OV3660_FRAME_SIZE,
+    };
+
+    ret = video_estimate_fmt_size(&data->format);
+    if (ret < 0) {
+        return ret;
+    }
+
+    data->format_valid = true;
+
+    k_msleep(10);
+    LOG_INF("OV3660 initialized (PID 0x%04x)", pid);
+    return 0;
 }
 
-static int ov3660_get_format(const struct device *dev, struct video_format *fmt)
+static int ov3660_get_format(const struct device *dev,
+                            struct video_format *fmt)
 {
-	ARG_UNUSED(dev);
+    struct ov3660_data *data = dev->data;
 
-	if (fmt->type != VIDEO_BUF_TYPE_OUTPUT) {
-		return -EINVAL;
-	}
+    if (fmt->type != VIDEO_BUF_TYPE_OUTPUT) {
+        return -EINVAL;
+    }
 
-	fmt->pixelformat = VIDEO_PIX_FMT_RGB565;
-	fmt->width = OV3660_FRAME_SIZE;
-	fmt->height = OV3660_FRAME_SIZE;
-	return video_estimate_fmt_size(fmt);
+    if (!data->format_valid) {
+        return -EIO;
+    }
+
+    *fmt = data->format;
+    return 0;
 }
 
-static int ov3660_set_format(const struct device *dev, struct video_format *fmt)
+static int ov3660_set_format(const struct device *dev,
+                            struct video_format *fmt)
 {
-	if (fmt->pixelformat != VIDEO_PIX_FMT_RGB565 ||
-	    fmt->width != OV3660_FRAME_SIZE || fmt->height != OV3660_FRAME_SIZE) {
-		return -ENOTSUP;
-	}
+    const struct i2c_dt_spec *bus = dev->config;
+    struct ov3660_data *data = dev->data;
+    struct video_format requested = *fmt;
 
-	return ov3660_get_format(dev, fmt);
+    if (requested.type != VIDEO_BUF_TYPE_OUTPUT) {
+        return -EINVAL;
+    }
+
+    bool rgb565 = requested.pixelformat == VIDEO_PIX_FMT_RGB565 &&
+                  requested.width == OV3660_FRAME_SIZE &&
+                  requested.height == OV3660_FRAME_SIZE;
+
+    bool qvga = requested.width == 320 && requested.height == 240;
+    bool qxga = requested.width == 2048 && requested.height == 1536;
+
+    bool jpeg = requested.pixelformat == VIDEO_PIX_FMT_JPEG &&
+                (qvga || qxga);
+    if (!rgb565 && !jpeg) {
+        return -ENOTSUP;
+    }
+
+    int ret = video_estimate_fmt_size(&requested);
+    if (ret < 0) {
+        return ret;
+    }
+    if (jpeg && qxga) {
+        requested.pitch = 0;
+        requested.size = 1024U * 1024U;
+    }
+
+    if (data->format_valid &&
+        requested.pixelformat == data->format.pixelformat &&
+        requested.width == data->format.width &&
+        requested.height == data->format.height) {
+        *fmt = data->format;
+        return 0;
+    }
+
+    /* A failed register write can leave the sensor partly configured. */
+    data->format_valid = false;
+
+    ret = ov3660_write_table(bus, ov3660_defaults,
+                            ARRAY_SIZE(ov3660_defaults));
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = ov3660_write_table(bus, ov3660_snapshot_mode,
+                            ARRAY_SIZE(ov3660_snapshot_mode));
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (jpeg) {
+        ret = ov3660_write_table(bus, ov3660_jpeg_qvga_mode,
+                                ARRAY_SIZE(ov3660_jpeg_qvga_mode));
+        if (ret < 0) {
+            return ret;
+        }
+
+        if (qxga) {
+            ret = ov3660_write_table(bus, ov3660_jpeg_qxga_mode,
+                                    ARRAY_SIZE(ov3660_jpeg_qxga_mode));
+            if (ret < 0) {
+                return ret;
+            }
+        }
+    }
+
+    k_msleep(10);
+
+    data->format = requested;
+    data->format_valid = true;
+    *fmt = requested;
+
+    return 0;
 }
 
 static int ov3660_get_caps(const struct device *dev, struct video_caps *caps)
@@ -224,6 +332,9 @@ static DEVICE_API(video, ov3660_api) = {
 };
 
 static const struct i2c_dt_spec ov3660_bus = I2C_DT_SPEC_INST_GET(0);
+static struct ov3660_data ov3660_runtime;
 
-DEVICE_DT_INST_DEFINE(0, ov3660_init, NULL, NULL, &ov3660_bus, POST_KERNEL,
-		      CONFIG_VIDEO_INIT_PRIORITY, &ov3660_api);
+DEVICE_DT_INST_DEFINE(0, ov3660_init, NULL,
+                      &ov3660_runtime, &ov3660_bus,
+                      POST_KERNEL, CONFIG_VIDEO_INIT_PRIORITY,
+                      &ov3660_api);

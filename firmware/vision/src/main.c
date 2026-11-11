@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <esp_cache.h>
+#include <esp_memory_utils.h>
 #include <hal/usb_serial_jtag_ll.h>
 #include <string.h>
 #include <zephyr/device.h>
@@ -90,7 +92,6 @@ static int send_usb_bytes(const void *data, size_t length)
             k_msleep(1);
         }
 
-        /* Fill a USB packet before flushing instead of flushing every byte. */
         size_t sent = usb_serial_jtag_ll_write_txfifo(bytes, MIN(length, 64));
 
         usb_serial_jtag_ll_txfifo_flush();
@@ -103,9 +104,18 @@ static int send_usb_bytes(const void *data, size_t length)
 
 static int send_frame(const struct video_format *fmt, const struct video_buffer *frame)
 {
+    if (esp_ptr_external_ram(frame->buffer)) {
+        int sync_ret = esp_cache_msync(frame->buffer, fmt->size,
+                                      ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        if (sync_ret != 0) {
+            printk("ERROR: synchronizing image memory (%d)\n", sync_ret);
+            return -EIO;
+        }
+    }
+
     char header[64];
-    int length = snprintk(header, sizeof(header), "\nFRAME %u %u %u %u\n",
-                          fmt->width, fmt->height, fmt->pitch, frame->bytesused);
+    int length = snprintk(header, sizeof(header), "\nJPEG %u %u %u\n",
+                         fmt->width, fmt->height, frame->bytesused);
 
     if (length < 0 || (size_t)length >= sizeof(header)) {
         return -EINVAL;
@@ -128,9 +138,9 @@ int main(void)
     const struct device *sensor = DEVICE_DT_GET(DT_PHANDLE(DT_CHOSEN(zephyr_camera), source));
     struct video_format fmt = {
         .type = VIDEO_BUF_TYPE_OUTPUT,
-        .pixelformat = VIDEO_PIX_FMT_RGB565,
-        .width = 240,
-        .height = 240,
+        .pixelformat = VIDEO_PIX_FMT_JPEG,
+        .width = 2048,
+        .height = 1536,
     };
     struct video_buffer *buffers[2];
 
@@ -148,7 +158,7 @@ int main(void)
 
     ret = video_set_format(camera, &fmt);
     if (ret < 0) {
-        printk("ERROR: setting RGB565 format (%d)\n", ret);
+        printk("ERROR: setting JPEG format (%d)\n", ret);
         return 0;
     }
 
@@ -160,7 +170,14 @@ int main(void)
             return 0;
         }
         buffers[i]->type = VIDEO_BUF_TYPE_OUTPUT;
+        if (!esp_ptr_external_ram(buffers[i]->buffer)) {
+            printk("ERROR: image buffer is not in PSRAM\n");
+            return 0;
+        }
     }
+
+    printk("JPEG mode %u x %u, buffer capacity %u bytes in PSRAM\n",
+           fmt.width, fmt.height, fmt.size);
 
     for (;;) {
         struct video_buffer *frame = NULL;
@@ -178,6 +195,12 @@ int main(void)
         printk("Capturing image.\n");
         for (size_t i = 0; i < ARRAY_SIZE(buffers); i++) {
             memset(buffers[i]->buffer, 0, fmt.size);
+            ret = esp_cache_msync(buffers[i]->buffer, fmt.size,
+                                 ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            if (ret != 0) {
+                printk("ERROR: preparing capture memory (%d)\n", ret);
+                return 0;
+            }
             ret = video_enqueue(camera, buffers[i]);
             if (ret < 0) {
                 printk("ERROR: queueing video buffer (%d)\n", ret);
@@ -192,9 +215,9 @@ int main(void)
         }
 
         /* The first DMA buffer can start in the middle of a sensor frame. */
-        ret = video_dequeue(camera, &frame, K_SECONDS(3));
+        ret = video_dequeue(camera, &frame, K_SECONDS(10));
         if (ret == 0) {
-            ret = video_dequeue(camera, &frame, K_SECONDS(3));
+            ret = video_dequeue(camera, &frame, K_SECONDS(10));
         }
 
         int stop_ret = video_stream_stop(camera, VIDEO_BUF_TYPE_OUTPUT);
@@ -205,8 +228,11 @@ int main(void)
 
         if (ret < 0) {
             report_capture_error(sensor, ret);
-        } else if (frame->bytesused != fmt.size) {
-            printk("ERROR: incomplete frame (%u of %u bytes)\n", frame->bytesused, fmt.size);
+        } else if (frame->bytesused == 0 ||
+                   frame->bytesused > fmt.size ||
+                   frame->bytesused > frame->size) {
+            printk("ERROR: invalid JPEG length (%u, capacity %u)\n",
+                   frame->bytesused, frame->size);
         } else {
             ret = send_frame(&fmt, frame);
             if (ret < 0) {

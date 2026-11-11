@@ -1,0 +1,216 @@
+diff --git a/drivers/dma/dma_esp32_gdma.c b/drivers/dma/dma_esp32_gdma.c
+index 1b1427d8765..fb3bfe29d20 100644
+--- a/drivers/dma/dma_esp32_gdma.c
++++ b/drivers/dma/dma_esp32_gdma.c
+@@ -528,13 +528,26 @@ static int dma_esp32_get_status(const struct device *dev, uint32_t channel,
+ 	if (dma_channel->dir == DMA_RX) {
+ 		status->busy = !gdma_ll_rx_is_desc_fsm_idle(data->hal.dev, dma_channel->channel_id);
+ 		status->dir = PERIPHERAL_TO_MEMORY;
+-		desc = (dma_descriptor_t *)gdma_ll_rx_get_prefetched_desc_addr(
++		uintptr_t first = (uintptr_t)dma_channel->desc_list;
++		uintptr_t end = first + sizeof(dma_channel->desc_list);
++		uintptr_t address = gdma_ll_rx_get_success_eof_desc_addr(
+ 			data->hal.dev, dma_channel->channel_id);
+-		if (desc >= dma_channel->desc_list) {
++
++		/* The prefetched descriptor can be beyond the completed frame. */
++		if (address < first || address >= end ||
++		    (address - first) % sizeof(dma_descriptor_t) != 0 ||
++		    !((dma_descriptor_t *)address)->dw0.suc_eof) {
++			address = gdma_ll_rx_get_prefetched_desc_addr(
++				data->hal.dev, dma_channel->channel_id);
++		}
++
++		if (address >= first && address < end &&
++		    (address - first) % sizeof(dma_descriptor_t) == 0) {
++			desc = (dma_descriptor_t *)address;
+ 			status->read_position = desc - dma_channel->desc_list;
+-			status->total_copied = desc->dw0.length
+-						+ dma_channel->desc_list[0].dw0.size
+-						* status->read_position;
++			for (size_t i = 0; i <= status->read_position; i++) {
++				status->total_copied += dma_channel->desc_list[i].dw0.length;
++			}
+ 		}
+ 	} else if (dma_channel->dir == DMA_TX) {
+ 		status->busy = !gdma_ll_tx_is_desc_fsm_idle(data->hal.dev, dma_channel->channel_id);
+diff --git a/drivers/video/video_esp32_dvp.c b/drivers/video/video_esp32_dvp.c
+index 1e94f3b8d4b..38ca08bae5d 100644
+--- a/drivers/video/video_esp32_dvp.c
++++ b/drivers/video/video_esp32_dvp.c
+@@ -24,7 +24,7 @@
+ 
+ LOG_MODULE_REGISTER(video_esp32_lcd_cam, CONFIG_VIDEO_LOG_LEVEL);
+ 
+-#define VIDEO_ESP32_DMA_BUFFER_MAX_SIZE 4095
++#define VIDEO_ESP32_DMA_BUFFER_MAX_SIZE 4032
+ #define VIDEO_ESP32_VSYNC_MASK          0x04
+ 
+ #ifdef CONFIG_POLL
+@@ -71,30 +71,44 @@ struct video_esp32_data {
+ #endif
+ };
+ 
++void video_esp32_dma_rx_done(const struct device *dev, void *user_data,
++			   uint32_t channel, int status);
++
+ static int video_esp32_reload_dma(struct video_esp32_data *data)
+ {
+ 	const struct video_esp32_config *cfg = data->config;
+-	int ret = 0;
++	struct dma_config dma_cfg = {
++		.channel_direction = PERIPHERAL_TO_MEMORY,
++		.dma_callback = video_esp32_dma_rx_done,
++		.user_data = data,
++		.dma_slot = SOC_GDMA_TRIG_PERIPH_CAM0,
++		.complete_callback_en = 1,
++		.head_block = &data->dma_blocks[0],
++	};
+ 
+ 	if (data->active_vbuf == NULL) {
+-		LOG_ERR("No video buffer available. Enqueue some buffers first.");
+ 		return -EAGAIN;
+ 	}
+ 
+-	ret = dma_reload(cfg->dma_dev, cfg->rx_dma_channel, 0, (uint32_t)data->active_vbuf->buffer,
+-			 data->active_vbuf->bytesused);
+-	if (ret < 0) {
+-		LOG_ERR("Unable to reload DMA (%d)", ret);
+-		return ret;
++	uint32_t offset = 0;
++	struct dma_block_config *block = dma_cfg.head_block;
++
++	while (block != NULL) {
++		block->dest_address = (uint32_t)data->active_vbuf->buffer + offset;
++		offset += block->block_size;
++		dma_cfg.block_count++;
++		block = block->next_block;
+ 	}
+ 
+-	ret = dma_start(cfg->dma_dev, cfg->rx_dma_channel);
++	data->active_vbuf->bytesused = 0;
++
++	int ret = dma_config(cfg->dma_dev, cfg->rx_dma_channel, &dma_cfg);
+ 	if (ret < 0) {
+-		LOG_ERR("Unable to start DMA (%d)", ret);
++		LOG_ERR("Unable to configure next DMA buffer (%d)", ret);
+ 		return ret;
+ 	}
+ 
+-	return 0;
++	return dma_start(cfg->dma_dev, cfg->rx_dma_channel);
+ }
+ 
+ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t channel,
+@@ -119,9 +133,39 @@ void video_esp32_dma_rx_done(const struct device *dev, void *user_data, uint32_t
+ 		return;
+ 	}
+ 
++	bool frame_valid = true;
++
++	if (data->video_format.pixelformat == VIDEO_PIX_FMT_JPEG) {
++		const struct video_esp32_config *cfg = data->config;
++		struct dma_status rx_status = {0};
++		int ret = dma_get_status(cfg->dma_dev, cfg->rx_dma_channel, &rx_status);
++
++		if (ret < 0) {
++			LOG_ERR("Cannot read JPEG DMA status (%d)", ret);
++			data->active_vbuf->bytesused = 0;
++			frame_valid = false;
++		} else if (rx_status.total_copied == 0 ||
++			   rx_status.total_copied > data->video_format.size) {
++			LOG_ERR("Invalid JPEG DMA byte count: %u",
++				(unsigned int)rx_status.total_copied);
++			data->active_vbuf->bytesused = 0;
++			frame_valid = false;
++		} else {
++			data->active_vbuf->bytesused = rx_status.total_copied;
++			LOG_INF("JPEG DMA reported %u bytes",
++				(unsigned int)rx_status.total_copied);
++		}
++	} else {
++		data->active_vbuf->bytesused = data->video_format.size;
++	}
++
+ 	data->active_vbuf->timestamp = k_uptime_get_32();
+ 	k_fifo_put(&data->fifo_out, data->active_vbuf);
+-	VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
++	if (frame_valid) {
++		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_DONE)
++	} else {
++		VIDEO_ESP32_RAISE_OUT_SIG_IF_ENABLED(VIDEO_BUF_ERROR)
++	}
+ 	data->active_vbuf = k_fifo_get(&data->fifo_in, K_NO_WAIT);
+ 
+ 	if (data->active_vbuf == NULL) {
+@@ -185,12 +229,12 @@ static int video_esp32_set_stream(const struct device *dev, bool enable, enum vi
+ 		return -EAGAIN;
+ 	}
+ 
+-	buffer_size = data->active_vbuf->bytesused;
++	buffer_size = data->video_format.size;
+ 	memset(data->dma_blocks, 0, sizeof(data->dma_blocks));
+ 	for (int i = 0; i < CONFIG_DMA_ESP32_MAX_DESCRIPTOR_NUM; ++i) {
+ 		dma_block_iter->dest_address =
+ 			(uint32_t)data->active_vbuf->buffer + (i * VIDEO_ESP32_DMA_BUFFER_MAX_SIZE);
+-		if (buffer_size < VIDEO_ESP32_DMA_BUFFER_MAX_SIZE) {
++		if (buffer_size <= VIDEO_ESP32_DMA_BUFFER_MAX_SIZE) {
+ 			dma_block_iter->block_size = buffer_size;
+ 			dma_block_iter->next_block = NULL;
+ 			dma_cfg.block_count = i + 1;
+@@ -261,9 +305,11 @@ static int video_esp32_get_fmt(const struct device *dev, struct video_format *fm
+ 		return ret;
+ 	}
+ 
+-	ret = video_estimate_fmt_size(fmt);
+-	if (ret < 0) {
+-		return ret;
++	if (fmt->pixelformat != VIDEO_PIX_FMT_JPEG) {
++		ret = video_estimate_fmt_size(fmt);
++		if (ret < 0) {
++			return ret;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -280,9 +326,11 @@ static int video_esp32_set_fmt(const struct device *dev, struct video_format *fm
+ 		return ret;
+ 	}
+ 
+-	ret = video_estimate_fmt_size(fmt);
+-	if (ret < 0) {
+-		return ret;
++	if (fmt->pixelformat != VIDEO_PIX_FMT_JPEG) {
++		ret = video_estimate_fmt_size(fmt);
++		if (ret < 0) {
++			return ret;
++		}
+ 	}
+ 
+ 	data->video_format = *fmt;
+@@ -294,7 +342,15 @@ static int video_esp32_enqueue(const struct device *dev, struct video_buffer *vb
+ {
+ 	struct video_esp32_data *data = dev->data;
+ 
+-	vbuf->bytesused = data->video_format.pitch * data->video_format.height;
++	if (data->video_format.size == 0) {
++		return -EINVAL;
++	}
++
++	if (vbuf->size < data->video_format.size) {
++		return -ENOBUFS;
++	}
++
++	vbuf->bytesused = 0;
+ 	vbuf->line_offset = 0;
+ 
+ 	k_fifo_put(&data->fifo_in, vbuf);
+@@ -303,7 +359,7 @@ static int video_esp32_enqueue(const struct device *dev, struct video_buffer *vb
+ }
+ 
+ static int video_esp32_dequeue(const struct device *dev, struct video_buffer **vbuf,
+-			       k_timeout_t timeout)
++			     k_timeout_t timeout)
+ {
+ 	struct video_esp32_data *data = dev->data;
+ 
