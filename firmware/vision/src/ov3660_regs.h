@@ -337,7 +337,7 @@ static const struct ov3660_reg ov3660_jpeg_qxga_mode[] = {
     { 0x3815, 0x11 },
 
     { 0x303b, 0x18 },
-    { 0x3824, 0x08 },
+    { 0x3824, 0x0c },
 };
 
 #endif /* VISION_OV3660_REGS_H_ */

@@ -5,7 +5,6 @@
 #include <errno.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -13,12 +12,14 @@
 #include <zephyr/sys/util.h>
 
 #include "ov3660_regs.h"
-#include "ov3660.h"
 
 LOG_MODULE_REGISTER(vision_ov3660, CONFIG_VIDEO_LOG_LEVEL);
 
 #define OV3660_PID_HIGH_REG 0x300a
 #define OV3660_PID_LOW_REG  0x300b
+#define OV3660_SYSTEM_CTRL  0x3008
+#define OV3660_STREAMING    0x02
+#define OV3660_STANDBY      0x42
 #define OV3660_PID          0x3660
 #define OV3660_FRAME_SIZE   240
 #define OV3660_STARTUP_MS   100
@@ -91,48 +92,6 @@ static int ov3660_write_table(const struct i2c_dt_spec *bus, const struct ov3660
 	}
 
 	return 0;
-}
-
-int ov3660_test_vsync_pin(const struct device *sensor, const struct device *gpio,
-			 gpio_pin_t pin, int *low, int *high)
-{
-	const struct i2c_dt_spec *bus = sensor->config;
-	const uint16_t pad_value_reg = 0x301a;
-	const uint16_t pad_select_reg = 0x301d;
-	const uint8_t vsync_pad = BIT(6);
-	uint8_t value, selection;
-	int ret, restore_selection, restore_value;
-
-	ret = ov3660_read(bus, pad_value_reg, &value);
-	if (ret == 0) {
-		ret = ov3660_read(bus, pad_select_reg, &selection);
-	}
-	if (ret < 0) {
-		return ret;
-	}
-
-	ret = ov3660_write(bus, pad_value_reg, value & ~vsync_pad);
-	if (ret == 0) {
-		ret = ov3660_write(bus, pad_select_reg, selection | vsync_pad);
-	}
-	if (ret == 0) {
-		*low = gpio_pin_get_raw(gpio, pin);
-		ret = *low < 0 ? *low : ov3660_write(bus, pad_value_reg, value | vsync_pad);
-	}
-	if (ret == 0) {
-		*high = gpio_pin_get_raw(gpio, pin);
-		ret = *high < 0 ? *high : 0;
-	}
-
-	restore_selection = ov3660_write(bus, pad_select_reg, selection);
-	restore_value = ov3660_write(bus, pad_value_reg, value);
-	if (restore_selection < 0) {
-		return restore_selection;
-	}
-	if (restore_value < 0) {
-		return restore_value;
-	}
-	return ret;
 }
 
 static int ov3660_init(const struct device *dev)
@@ -296,6 +255,11 @@ static int ov3660_set_format(const struct device *dev,
 
     k_msleep(10);
 
+    ret = ov3660_write(bus, OV3660_SYSTEM_CTRL, OV3660_STANDBY);
+    if (ret < 0) {
+        return ret;
+    }
+
     data->format = requested;
     data->format_valid = true;
     *fmt = requested;
@@ -317,11 +281,13 @@ static int ov3660_get_caps(const struct device *dev, struct video_caps *caps)
 
 static int ov3660_set_stream(const struct device *dev, bool enable, enum video_buf_type type)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(enable);
+    const struct i2c_dt_spec *bus = dev->config;
 
-	/* The sensor emits frames after initialization. The DVP driver gates capture. */
-	return type == VIDEO_BUF_TYPE_OUTPUT ? 0 : -EINVAL;
+    if (type != VIDEO_BUF_TYPE_OUTPUT) {
+        return -EINVAL;
+    }
+
+    return ov3660_write(bus, OV3660_SYSTEM_CTRL, enable ? OV3660_STREAMING : OV3660_STANDBY);
 }
 
 static DEVICE_API(video, ov3660_api) = {
