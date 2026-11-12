@@ -332,6 +332,7 @@ int main(void)
                 break;
             }
 
+            /* Try the newer frame first and keep the first as a backup. */
             ret = second ? send_frame(&fmt, second) : -EBADMSG;
             if (ret == -EBADMSG && first) {
                 printk("Trying the other captured frame.\n");
