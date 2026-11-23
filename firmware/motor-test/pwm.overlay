@@ -1,0 +1,56 @@
+#include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+#include <zephyr/dt-bindings/pwm/pwm.h>
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+	conveyor_sensor: conveyor-sensor {
+		compatible = "hc-sr04";
+		trigger-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
+		echo-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+	};
+
+	zephyr,user {
+		pwms = <&ledc0 0 PWM_HZ(1000) PWM_POLARITY_NORMAL>;
+		io-channels = <&adc0 1>;
+		in3-gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+		in4-gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+		encoder-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&adc0 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,resolution = <12>;
+	};
+};
+
+&pinctrl {
+	motor_pwm_pins: motor_pwm_pins {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO1>;
+			output-enable;
+		};
+	};
+};
+
+&ledc0 {
+	status = "okay";
+	pinctrl-0 = <&motor_pwm_pins>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel0@0 {
+		reg = <0>;
+		timer = <0>;
+	};
+};
