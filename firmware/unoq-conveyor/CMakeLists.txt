@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(unoq_conveyor)
+
+target_sources(app PRIVATE ../motor-test/src/main.c)
+target_compile_definitions(app PRIVATE UNOQ_CONVEYOR)
+
+option(UNOQ_STEP_TEST "Build the open-loop motor step test" OFF)
+option(UNOQ_AUTO_STEP_TEST "Run the 60% to 90% motor step automatically at boot" OFF)
+option(UNOQ_SPEED_PI "Build the encoder speed controller" OFF)
+if((UNOQ_STEP_TEST AND UNOQ_AUTO_STEP_TEST) OR
+   (UNOQ_SPEED_PI AND (UNOQ_STEP_TEST OR UNOQ_AUTO_STEP_TEST)))
+  message(FATAL_ERROR "Select only one UNO Q motor mode")
+endif()
+if(UNOQ_STEP_TEST OR UNOQ_AUTO_STEP_TEST)
+  target_compile_definitions(app PRIVATE MOTOR_STEP_TEST)
+endif()
+if(UNOQ_AUTO_STEP_TEST)
+  target_compile_definitions(app PRIVATE UNOQ_AUTO_STEP_TEST)
+endif()
+if(UNOQ_SPEED_PI)
+  target_compile_definitions(app PRIVATE UNOQ_SPEED_PI)
+endif()

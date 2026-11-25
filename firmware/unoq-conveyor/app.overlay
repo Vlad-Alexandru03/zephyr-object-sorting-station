@@ -1,0 +1,33 @@
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/pwm/pwm.h>
+
+/ {
+	chosen {
+		zephyr,console = &lpuart1;
+	};
+
+	conveyor_sensor: conveyor-sensor {
+		compatible = "hc-sr04";
+		trigger-gpios = <&gpiob 4 GPIO_ACTIVE_HIGH>;
+		echo-gpios = <&gpiob 8 GPIO_ACTIVE_HIGH>;
+	};
+
+	zephyr,user {
+		pwms = <&conveyor_pwm 3 PWM_HZ(1000) PWM_POLARITY_NORMAL>;
+		io-channels = <&adc1 9>;
+		in3-gpios = <&gpiob 1 GPIO_ACTIVE_HIGH>;
+		in4-gpios = <&gpiob 2 GPIO_ACTIVE_HIGH>;
+		encoder-gpios = <&gpiob 3 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&timers3 {
+	st,prescaler = <159>;
+	status = "okay";
+
+	conveyor_pwm: pwm {
+		pinctrl-0 = <&tim3_ch3_pb0>;
+		pinctrl-names = "default";
+		status = "okay";
+	};
+};

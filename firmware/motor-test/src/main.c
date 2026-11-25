@@ -17,9 +17,11 @@
 static const struct gpio_dt_spec in3 = GPIO_DT_SPEC_GET(MOTOR_NODE, in3_gpios);
 static const struct gpio_dt_spec in4 = GPIO_DT_SPEC_GET(MOTOR_NODE, in4_gpios);
 static const struct pwm_dt_spec motor_enable = PWM_DT_SPEC_GET(MOTOR_NODE);
+
+#ifndef UNOQ_AUTO_STEP_TEST
 static const struct device *const distance_sensor = DEVICE_DT_GET(DT_NODELABEL(conveyor_sensor));
 
-static bool conveyor_path_is_clear(void)
+static bool conveyor_path_is_clear(int *measured_mm)
 {
 	static bool was_blocked;
 	struct sensor_value distance;
@@ -29,6 +31,9 @@ static bool conveyor_path_is_clear(void)
 	    sensor_sample_fetch_chan(distance_sensor, SENSOR_CHAN_DISTANCE) == 0 &&
 	    sensor_channel_get(distance_sensor, SENSOR_CHAN_DISTANCE, &distance) == 0) {
 		distance_mm = sensor_value_to_milli(&distance);
+	}
+	if (measured_mm != NULL) {
+		*measured_mm = (int)distance_mm;
 	}
 
 	bool blocked = distance_mm > 0 && distance_mm < OBJECT_STOP_MM;
@@ -43,16 +48,10 @@ static bool conveyor_path_is_clear(void)
 
 	return !blocked;
 }
+#endif
 
-#ifdef MOTOR_STEP_TEST
-#define STEP_LOW_DUTY 35U
-#define STEP_HIGH_DUTY 60U
-#define STEP_AT_MS 5000
-#define STEP_END_MS 10000
-#define SAMPLE_MS 100
-
+#if defined(MOTOR_STEP_TEST) || defined(UNOQ_CONVEYOR)
 static const struct gpio_dt_spec encoder = GPIO_DT_SPEC_GET(MOTOR_NODE, encoder_gpios);
-static const struct gpio_dt_spec boot_button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_callback encoder_callback;
 static atomic_t encoder_count;
 
@@ -62,96 +61,31 @@ static void count_encoder_edge(const struct device *port, struct gpio_callback *
 	atomic_inc(&encoder_count);
 }
 
-static int set_step_duty(uint32_t duty)
+static int setup_encoder(void)
 {
-	return pwm_set_pulse_dt(&motor_enable, motor_enable.period * duty / 100U);
-}
-
-static const char *record_step(void)
-{
-	if (!conveyor_path_is_clear()) {
-		return "path blocked";
+	if (!gpio_is_ready_dt(&encoder)) {
+		return -ENODEV;
 	}
 
-	atomic_clear(&encoder_count);
-	if (set_step_duty(STEP_LOW_DUTY) < 0) {
-		return "could not apply 35% PWM";
-	}
-
-	int64_t start_ms = k_uptime_get();
-	uint32_t duty = STEP_LOW_DUTY;
-	atomic_val_t settling_count = 0;
-
-	printk("STEP,0,%u,0\n", duty);
-	for (int sample_ms = SAMPLE_MS; sample_ms <= STEP_END_MS; sample_ms += SAMPLE_MS) {
-		k_sleep(K_TIMEOUT_ABS_MS(start_ms + sample_ms));
-		if (!conveyor_path_is_clear()) {
-			return "path blocked";
-		}
-
-		atomic_val_t count = atomic_get(&encoder_count);
-		if (sample_ms == STEP_AT_MS - 1000) {
-			settling_count = count;
-		}
-		if (sample_ms == STEP_AT_MS) {
-			if (count == settling_count) {
-				return "no encoder pulses during the last second at 35% PWM";
-			}
-			if (set_step_duty(STEP_HIGH_DUTY) < 0) {
-				return "could not apply 60% PWM";
-			}
-			duty = STEP_HIGH_DUTY;
-		}
-		printk("STEP,%u,%u,%u\n", (unsigned int)(k_uptime_get() - start_ms),
-		       duty, (unsigned int)count);
-	}
-	return NULL;
-}
-
-static void run_step_test(void)
-{
-	if (!device_is_ready(distance_sensor) || !gpio_is_ready_dt(&encoder) ||
-	    !gpio_is_ready_dt(&boot_button) ||
-	    gpio_pin_configure_dt(&encoder, GPIO_INPUT | GPIO_PULL_UP) < 0 ||
-	    gpio_pin_configure_dt(&boot_button, GPIO_INPUT) < 0) {
-		printk("STEP_ABORT,encoder, button or distance sensor setup failed\n");
-		return;
+	int ret = gpio_pin_configure_dt(&encoder, GPIO_INPUT | GPIO_PULL_UP);
+	if (ret < 0) {
+		return ret;
 	}
 
 	gpio_init_callback(&encoder_callback, count_encoder_edge, BIT(encoder.pin));
-	if (gpio_add_callback(encoder.port, &encoder_callback) < 0 ||
-	    gpio_pin_interrupt_configure_dt(&encoder, GPIO_INT_EDGE_RISING) < 0) {
-		printk("STEP_ABORT,encoder interrupt setup failed\n");
-		return;
+	ret = gpio_add_callback(encoder.port, &encoder_callback);
+	if (ret < 0) {
+		return ret;
 	}
-
-	printk("Press BOOT for the 35%% to 60%% PWM step test.\n");
-	int pressed;
-	do {
-		k_sleep(K_MSEC(20));
-		pressed = gpio_pin_get_dt(&boot_button);
-	} while (pressed == 0);
-
-	const char *error = pressed < 0 ? "could not read BOOT button" : record_step();
-	if (set_step_duty(0) < 0) {
-		gpio_pin_set_dt(&in3, 0);
-		gpio_pin_set_dt(&in4, 0);
-		error = "could not set PWM to zero, motor inputs set low";
-	}
-	if (error != NULL) {
-		printk("STEP_ABORT,%s\n", error);
-	} else {
-		printk("STEP_DONE\n");
-	}
+	return gpio_pin_interrupt_configure_dt(&encoder, GPIO_INT_EDGE_RISING);
 }
-#else
-static const struct adc_dt_spec speed_knob = ADC_DT_SPEC_GET(MOTOR_NODE);
-static void update_motor_speed(struct k_work *work);
-static K_WORK_DELAYABLE_DEFINE(speed_work, update_motor_speed);
+#endif
 
-static void update_motor_speed(struct k_work *work)
+#if !defined(MOTOR_STEP_TEST) || (defined(UNOQ_CONVEYOR) && !defined(UNOQ_AUTO_STEP_TEST))
+static const struct adc_dt_spec speed_knob = ADC_DT_SPEC_GET(MOTOR_NODE);
+
+static int read_knob_mv(int32_t *voltage_mv)
 {
-	static int last_duty;
 	uint16_t raw;
 	struct adc_sequence sequence = {
 		.buffer = &raw,
@@ -163,26 +97,333 @@ static void update_motor_speed(struct k_work *work)
 		ret = adc_read_dt(&speed_knob, &sequence);
 	}
 	if (ret < 0) {
+		return ret;
+	}
+
+	*voltage_mv = raw;
+	return adc_raw_to_millivolts_dt(&speed_knob, voltage_mv);
+}
+#endif
+
+#ifdef MOTOR_STEP_TEST
+#ifdef UNOQ_AUTO_STEP_TEST
+#define STEP_LOW_DUTY 60U
+#define STEP_HIGH_DUTY 90U
+#define STEP_AT_MS 10000
+#define STEP_END_MS 20000
+#else
+#define STEP_LOW_DUTY 35U
+#define STEP_HIGH_DUTY 60U
+#define STEP_AT_MS 5000
+#define STEP_END_MS 10000
+#endif
+#define SAMPLE_MS 100
+
+#ifdef UNOQ_CONVEYOR
+struct step_sample {
+	uint32_t elapsed_ms;
+	uint32_t duty;
+	uint32_t pulses;
+};
+
+/* Keep a copy for SWD readout after the run, when Linux owns the serial port. */
+static volatile struct {
+	uint32_t finished;
+	uint32_t count;
+	const char *error;
+	struct step_sample samples[1 + STEP_END_MS / SAMPLE_MS];
+} unoq_step_log;
+#endif
+
+#ifdef UNOQ_AUTO_STEP_TEST
+static int wait_for_step_start(void)
+{
+	printk("Automatic step test starts in 5 seconds.\n");
+	k_sleep(K_SECONDS(5));
+	return 0;
+}
+#elif defined(UNOQ_CONVEYOR)
+static int wait_for_step_start(void)
+{
+	int32_t voltage_mv;
+	bool knob_zero_seen = false;
+
+	printk("Step test ready. Turn the knob fully down, then fully up to start.\n");
+	for (;;) {
+		int ret = read_knob_mv(&voltage_mv);
+		if (ret < 0) {
+			return ret;
+		}
+		if (voltage_mv <= POT_STOP_MV) {
+			knob_zero_seen = true;
+		}
+		if (knob_zero_seen && voltage_mv >= POT_FULL_MV) {
+			return 0;
+		}
+		k_sleep(K_MSEC(20));
+	}
+}
+#else
+static const struct gpio_dt_spec boot_button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+
+static int wait_for_step_start(void)
+{
+	printk("Press BOOT for the 35%% to 60%% PWM step test.\n");
+	int pressed;
+	do {
+		k_sleep(K_MSEC(20));
+		pressed = gpio_pin_get_dt(&boot_button);
+	} while (pressed == 0);
+	return pressed < 0 ? pressed : 0;
+}
+#endif
+
+static void report_step_sample(uint32_t elapsed_ms, uint32_t duty, uint32_t pulses)
+{
+#ifdef UNOQ_CONVEYOR
+	uint32_t index = unoq_step_log.count;
+
+	unoq_step_log.samples[index] = (struct step_sample){elapsed_ms, duty, pulses};
+	unoq_step_log.count = index + 1;
+#endif
+	printk("STEP,%u,%u,%u\n", elapsed_ms, duty, pulses);
+}
+
+static int set_step_duty(uint32_t duty)
+{
+	return pwm_set_pulse_dt(&motor_enable, motor_enable.period * duty / 100U);
+}
+
+static const char *record_step(void)
+{
+#ifndef UNOQ_AUTO_STEP_TEST
+	if (!conveyor_path_is_clear(NULL)) {
+		return "path blocked";
+	}
+#endif
+
+	atomic_clear(&encoder_count);
+	if (set_step_duty(STEP_LOW_DUTY) < 0) {
+		return "could not apply the initial PWM duty";
+	}
+
+	int64_t start_ms = k_uptime_get();
+	uint32_t duty = STEP_LOW_DUTY;
+	atomic_val_t settling_count = 0;
+
+	report_step_sample(0, duty, 0);
+	for (int sample_ms = SAMPLE_MS; sample_ms <= STEP_END_MS; sample_ms += SAMPLE_MS) {
+		k_sleep(K_TIMEOUT_ABS_MS(start_ms + sample_ms));
+#if defined(UNOQ_CONVEYOR) && !defined(UNOQ_AUTO_STEP_TEST)
+		int32_t voltage_mv;
+		if (read_knob_mv(&voltage_mv) < 0 || voltage_mv <= POT_STOP_MV) {
+			return "speed knob at zero or ADC error";
+		}
+#endif
+#ifndef UNOQ_AUTO_STEP_TEST
+		if (!conveyor_path_is_clear(NULL)) {
+			return "path blocked";
+		}
+#endif
+
+		atomic_val_t count = atomic_get(&encoder_count);
+		if (sample_ms == STEP_AT_MS - 1000) {
+			settling_count = count;
+		}
+		if (sample_ms == STEP_AT_MS) {
+			if (count == settling_count) {
+				return "no encoder pulses during the last second before the step";
+			}
+			if (set_step_duty(STEP_HIGH_DUTY) < 0) {
+				return "could not apply the higher PWM duty";
+			}
+			duty = STEP_HIGH_DUTY;
+		}
+		report_step_sample((uint32_t)(k_uptime_get() - start_ms), duty, (uint32_t)count);
+	}
+	return NULL;
+}
+
+static const char *prepare_step_test(void)
+{
+#ifndef UNOQ_AUTO_STEP_TEST
+	if (!device_is_ready(distance_sensor)) {
+		return "distance sensor setup failed";
+	}
+#endif
+#if defined(UNOQ_CONVEYOR) && !defined(UNOQ_AUTO_STEP_TEST)
+	if (!adc_is_ready_dt(&speed_knob) || adc_channel_setup_dt(&speed_knob) < 0) {
+		return "speed knob setup failed";
+	}
+#elif !defined(UNOQ_CONVEYOR)
+	if (!gpio_is_ready_dt(&boot_button) ||
+	    gpio_pin_configure_dt(&boot_button, GPIO_INPUT) < 0) {
+		return "BOOT button setup failed";
+	}
+#endif
+
+	if (setup_encoder() < 0) {
+		return "encoder interrupt setup failed";
+	}
+
+	return wait_for_step_start() < 0 ? "could not read start control" : NULL;
+}
+
+static void run_step_test(void)
+{
+	const char *error = prepare_step_test();
+	if (error == NULL) {
+		error = record_step();
+	}
+	if (set_step_duty(0) < 0) {
+		gpio_pin_set_dt(&in3, 0);
+		gpio_pin_set_dt(&in4, 0);
+		error = "could not set PWM to zero, motor inputs set low";
+	}
+#ifdef UNOQ_CONVEYOR
+	unoq_step_log.error = error;
+	unoq_step_log.finished = 1;
+#endif
+	if (error != NULL) {
+		printk("STEP_ABORT,%s\n", error);
+	} else {
+		printk("STEP_DONE\n");
+	}
+}
+#else
+static void update_motor_speed(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(speed_work, update_motor_speed);
+
+#ifdef UNOQ_SPEED_PI
+#define SPEED_MIN_RPM 105
+#define SPEED_MAX_RPM 120
+#define SPEED_PULSES_PER_REV 20U
+#define SPEED_WINDOW_SAMPLES 5U
+#define SPEED_MAX_DUTY 90.0f
+#define SPEED_KP 0.234f
+#define SPEED_KI 0.635f
+#define SPEED_NO_PULSE_MS 1200
+
+static struct {
+	struct {
+		int64_t time_ms;
+		uint32_t pulses;
+	} history[SPEED_WINDOW_SAMPLES];
+	uint32_t index;
+	uint32_t samples;
+	uint32_t last_pulses;
+	int64_t last_pulse_ms;
+	int64_t last_update_ms;
+	float integral;
+	bool encoder_fault;
+} speed_pi;
+
+static int update_speed_pi(int target_rpm, int64_t now, uint32_t pulses, int *measured_rpm)
+{
+	uint32_t index = speed_pi.index;
+	int64_t window_ms = now - speed_pi.history[index].time_ms;
+	int64_t update_ms = MIN(now - speed_pi.last_update_ms, 250);
+	float speed = 0.0f;
+
+	if (speed_pi.samples == 0 || pulses != speed_pi.last_pulses) {
+		speed_pi.last_pulse_ms = now;
+	}
+	speed_pi.last_pulses = pulses;
+	if (now - speed_pi.last_pulse_ms >= SPEED_NO_PULSE_MS) {
+		return -EIO;
+	}
+
+	bool window_ready = speed_pi.samples == SPEED_WINDOW_SAMPLES && window_ms > 0;
+	if (window_ready) {
+		uint32_t pulse_delta = pulses - speed_pi.history[index].pulses;
+
+		speed = (float)pulse_delta * 60000.0f / ((float)window_ms * SPEED_PULSES_PER_REV);
+		*measured_rpm = (int)(speed + 0.5f);
+	}
+	speed_pi.history[index].time_ms = now;
+	speed_pi.history[index].pulses = pulses;
+	speed_pi.index = (index + 1) % SPEED_WINDOW_SAMPLES;
+	speed_pi.samples = MIN(speed_pi.samples + 1, SPEED_WINDOW_SAMPLES);
+	speed_pi.last_update_ms = now;
+
+	/* The 60% to 90% run gave about 103 to 124 RPM. */
+	float feedforward = 60.0f + (target_rpm - 103.0f) / 0.8f;
+	if (!window_ready) {
+		return (int)MAX(feedforward, 65.0f);
+	}
+
+	float error = target_rpm - speed;
+	float base_duty = feedforward + SPEED_KP * error;
+	float duty = base_duty + speed_pi.integral;
+	if ((error > 0 && duty < SPEED_MAX_DUTY) || (error < 0 && duty > 0)) {
+		speed_pi.integral += SPEED_KI * error * (float)update_ms / 1000.0f;
+		duty = base_duty + speed_pi.integral;
+	}
+	return (int)(CLAMP(duty, 0.0f, SPEED_MAX_DUTY) + 0.5f);
+}
+#endif
+
+static void update_motor_speed(struct k_work *work)
+{
+	static int last_duty;
+#ifdef UNOQ_CONVEYOR
+	static bool knob_zero_seen;
+	static int64_t next_status_ms;
+	int distance_mm;
+#endif
+	int32_t voltage_mv;
+	int ret = read_knob_mv(&voltage_mv);
+	if (ret < 0) {
 		pwm_set_pulse_dt(&motor_enable, 0);
 		printk("Speed knob ADC error (%d). Motor test stopped.\n", ret);
 		return;
 	}
 
-	int32_t voltage_mv = raw;
-	ret = adc_raw_to_millivolts_dt(&speed_knob, &voltage_mv);
-	if (ret < 0) {
-		pwm_set_pulse_dt(&motor_enable, 0);
-		printk("Could not convert speed knob reading (%d).\n", ret);
-		return;
-	}
-
 	int duty = 0;
-	if (conveyor_path_is_clear() && voltage_mv > POT_STOP_MV) {
+#ifdef UNOQ_CONVEYOR
+	bool path_clear = conveyor_path_is_clear(&distance_mm);
+	if (!knob_zero_seen && voltage_mv <= POT_STOP_MV) {
+		knob_zero_seen = true;
+		printk("Speed knob at zero. Conveyor ready.\n");
+	}
+	path_clear = path_clear && knob_zero_seen;
+#else
+	bool path_clear = conveyor_path_is_clear(NULL);
+#endif
+#ifdef UNOQ_SPEED_PI
+	int target_rpm = 0;
+	int measured_rpm = 0;
+	int64_t update_time = k_uptime_get();
+	uint32_t encoder_pulses = (uint32_t)atomic_get(&encoder_count);
+
+	if (voltage_mv <= POT_STOP_MV) {
+		speed_pi.encoder_fault = false;
+	}
+	if (path_clear && voltage_mv > POT_STOP_MV && !speed_pi.encoder_fault) {
+		int32_t travel = MIN(voltage_mv, POT_FULL_MV) - POT_STOP_MV;
+
+		target_rpm = SPEED_MIN_RPM + travel * (SPEED_MAX_RPM - SPEED_MIN_RPM) /
+			     (POT_FULL_MV - POT_STOP_MV);
+		duty = update_speed_pi(target_rpm, update_time, encoder_pulses, &measured_rpm);
+		if (duty < 0) {
+			speed_pi.encoder_fault = true;
+			duty = 0;
+			printk("No encoder pulses. Turn the knob to zero to rearm.\n");
+		}
+	}
+	if (duty == 0 && (target_rpm == 0 || speed_pi.encoder_fault)) {
+		speed_pi.index = 0;
+		speed_pi.samples = 0;
+		speed_pi.integral = 0.0f;
+	}
+#else
+	if (path_clear && voltage_mv > POT_STOP_MV) {
 		int32_t travel = MIN(voltage_mv, POT_FULL_MV) - POT_STOP_MV;
 
 		duty = MOTOR_MIN_DUTY + travel * (MOTOR_MAX_DUTY - MOTOR_MIN_DUTY) /
 		       (POT_FULL_MV - POT_STOP_MV);
 	}
+#endif
 
 	if (duty != last_duty) {
 		ret = pwm_set_pulse_dt(&motor_enable, motor_enable.period * duty / 100U);
@@ -195,6 +436,19 @@ static void update_motor_speed(struct k_work *work)
 		printk("Conveyor duty: %d%%\n", duty);
 	}
 
+#ifdef UNOQ_CONVEYOR
+	int64_t now = k_uptime_get();
+	if (now >= next_status_ms) {
+#ifdef UNOQ_SPEED_PI
+		printk("Speed: target=%d RPM, measured=%d RPM, PWM=%d%%, distance=%d mm\n",
+		       target_rpm, measured_rpm, duty, distance_mm);
+#else
+		printk("Conveyor: knob=%d mV, distance=%d mm, encoder=%u, PWM=%d%%\n",
+		       (int)voltage_mv, distance_mm, (unsigned int)atomic_get(&encoder_count), duty);
+#endif
+		next_status_ms = now + 1000;
+	}
+#endif
 	k_work_schedule(k_work_delayable_from_work(work), K_MSEC(100));
 }
 #endif
@@ -229,7 +483,12 @@ static void motor_test_start(void)
 		return;
 	}
 	if (!device_is_ready(distance_sensor)) {
+#ifdef UNOQ_CONVEYOR
+		printk("Distance sensor is not ready. Motor stopped.\n");
+		return;
+#else
 		printk("Distance sensor is not ready. Speed knob remains active.\n");
+#endif
 	}
 
 	int ret = adc_channel_setup_dt(&speed_knob);
@@ -238,6 +497,14 @@ static void motor_test_start(void)
 		return;
 	}
 
+#ifdef UNOQ_CONVEYOR
+	ret = setup_encoder();
+	if (ret < 0) {
+		printk("Encoder setup failed (%d). Motor stopped.\n", ret);
+		return;
+	}
+	printk("UNO Q conveyor. Turn knob to zero before running. Distance -1 means no echo.\n");
+#endif
 	printk("Conveyor speed knob ready. PWM at %u Hz.\n",
 	       NSEC_PER_SEC / motor_enable.period);
 	printk("Conveyor stops for readings below %d mm.\n", OBJECT_STOP_MM);
