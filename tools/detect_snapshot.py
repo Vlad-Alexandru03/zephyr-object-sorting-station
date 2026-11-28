@@ -16,26 +16,30 @@ def load_detector():
 
 
 def annotate(image, model, weights, threshold=0.5):
+    return draw_detections(image, predict(image, model, weights, threshold))
+
+
+def predict(image, model, weights, threshold=0.5):
     categories = weights.meta["categories"]
     image_tensor = weights.transforms()(image)
     with torch.inference_mode():
         prediction = model([image_tensor])[0]
 
+    return [
+        (categories[label.item()], score.item(), box.tolist())
+        for box, label, score in zip(prediction["boxes"], prediction["labels"], prediction["scores"])
+        if score.item() >= threshold
+    ]
+
+
+def draw_detections(image, predictions):
     draw = ImageDraw.Draw(image)
     font_size = max(14, round(min(image.size) * 0.03))
     font = ImageFont.load_default(size=font_size)
     padding = max(3, font_size // 5)
     detections = []
 
-    for box, label, score in zip(
-        prediction["boxes"], prediction["labels"], prediction["scores"]
-    ):
-        confidence = score.item()
-        if confidence < threshold:
-            continue
-
-        category = categories[label.item()]
-        x1, y1, x2, y2 = box.tolist()
+    for category, confidence, (x1, y1, x2, y2) in predictions:
         caption = f"{category} {confidence:.0%}"
         draw.rectangle((x1, y1, x2, y2), outline="lime", width=4)
         _, _, text_width, text_height = draw.textbbox(

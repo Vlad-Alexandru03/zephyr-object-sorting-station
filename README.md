@@ -1,12 +1,51 @@
 # Zephyr Object Sorting Station
 
-A one-slot station that identifies objects from a camera snapshot.
+A one-slot sorting station built around a Zephyr conveyor and an
+SO-101 arm. The conveyor UNO Q reads the ultrasonic sensor and the encoder.
+A phone sends snapshots to a second UNO Q (Qbot), which runs YOLO on Debian.
+The PC stops the conveyor when both sensors see an item at the pickup spot,
+then routes the item to its bin using taught SO-101 poses.
+
+A full cycle, from the belt stopping to the part landing in its bin, is in
+[docs/demo.mp4](docs/demo.mp4) (93 s). GitHub plays it in the browser when you
+open the file.
+
+[Set up and run fixed-position sorting](docs/fixed-position-sorting.md).
+Use `--ultrasonic-only` to stop the conveyor on ultrasound and let the camera
+select the taught pickup and bin for the box or tape roll.
+The [camera-guided pickup experiments](docs/camera-guided-pickup.md) are
+available as a separate bench workflow.
+
+Wiring for every board is in [docs/wiring.md](docs/wiring.md).
+
+## Start the station from a web page
+
+`tools/station_launcher.py` serves a page with Start and Stop buttons and owns
+the sorter process. It forwards the Qbot port and then starts
+`sort_station.py` with the fixed sorting arguments. Leave it running; it does not
+need the hardware to load.
+
+```powershell
+& .\.so101-venv\Scripts\python.exe -B .\zephyr-object-sorting-station\tools\station_launcher.py
+```
+
+Open <http://127.0.0.1:8766/> and press **Start**. The page shows the sorter's
+own output, and once a run is up the live view is at
+<http://127.0.0.1:8767/>. Press **Stop** to end the run; the launcher sends an
+interrupt so the belt is released rather than killing the process outright.
+
+The dashboard on 8767 only exists while a run is in progress, which is why the
+buttons live on 8766 instead.
+
+`--arm-port`, `--adb` and `--roi` override the defaults. Keep `--roi` in step
+with the pickup pose that was taught, otherwise the detection is filtered out.
+
+Wiring for every board is in [docs/wiring.md](docs/wiring.md).
+
+## Earlier ESP32 camera setup
 
 The ESP32-S3 with an OV3660 captures a 2048 × 1536 JPEG when you press BOOT.
-It stops Wi-Fi during capture, then reconnects to send the JPEG. The Arduino UNO Q
-runs object recognition on Debian and the station controller on Zephyr.
-
-## Camera and vision server
+It stops Wi-Fi during capture, then reconnects to send the JPEG to Qbot.
 
 Apply `patches/zephyr-camera-jpeg.patch` to a fresh Zephyr checkout at the
 revision in `west.yml`. The patch adds the DMA support used by the camera app.
@@ -131,12 +170,3 @@ from the step tests, and limits PWM to 90%. The gains are 0.234 PWM percentage
 points per RPM and 0.635 PWM percentage points per RPM-second. A valid object
 detection within 100 mm overrides the controller. If encoder pulses stop,
 turn the knob to zero before trying again.
-
-## First milestone
-
-Press Start and display the object label, `empty`, or `unknown`.
-
-## Later milestone
-
-Use the SO101 arm to sort recognized objects into taught drop-off locations,
-then take a second snapshot to verify that the slot is empty.

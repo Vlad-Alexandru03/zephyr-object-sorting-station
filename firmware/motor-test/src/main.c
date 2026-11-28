@@ -6,11 +6,18 @@
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/printk.h>
 
+#ifdef UNOQ_SORT_STATION
+#include <zephyr/drivers/uart.h>
+#include <zephyr/sys/ring_buffer.h>
+#include <stdlib.h>
+#endif
+
 #define POT_STOP_MV 200
 #define POT_FULL_MV 2800
 #define MOTOR_MIN_DUTY 0
 #define MOTOR_MAX_DUTY 50
 #define OBJECT_STOP_MM 100
+#define STATION_STOP_MM 25
 
 #define MOTOR_NODE DT_PATH(zephyr_user)
 
@@ -294,6 +301,80 @@ static void run_step_test(void)
 static void update_motor_speed(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(speed_work, update_motor_speed);
 
+#ifdef UNOQ_SORT_STATION
+static const struct device *const station_uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+RING_BUF_DECLARE(station_rx, 128);
+static uint32_t station_command;
+static int64_t run_until_ms;
+static int station_stop_mm = STATION_STOP_MM;
+static int station_trip_mm;
+static uint32_t jog_start_pulses;
+static int64_t jog_until_ms;
+
+#define STATION_JOG_DUTY 65
+#define STATION_JOG_TIMEOUT_MS 450
+
+static void station_uart_rx(const struct device *uart, void *user_data)
+{
+	uint8_t bytes[16];
+	int count;
+
+	uart_irq_update(uart);
+	if (!uart_irq_rx_ready(uart)) {
+		return;
+	}
+	while ((count = uart_fifo_read(uart, bytes, sizeof(bytes))) > 0) {
+		ring_buf_put(&station_rx, bytes, count);
+	}
+}
+
+static void read_station_commands(void)
+{
+	static char line[24];
+	static size_t length;
+	static bool overflow;
+	unsigned char ch;
+
+	for (int i = 0; i < 128 && ring_buf_get(&station_rx, &ch, 1) == 1; i++) {
+		if (ch == '\n') {
+			if (!overflow && length > 2 && line[1] == ' ' &&
+			    (line[0] == 'R' || line[0] == 'S' || line[0] == 'J') &&
+			    line[2] >= '1' && line[2] <= '9') {
+				char *end;
+				unsigned long stop_mm = STATION_STOP_MM;
+
+				line[length] = '\0';
+				unsigned long id = strtoul(line + 2, &end, 10);
+				if (line[0] == 'R' && *end == ' ') {
+					stop_mm = strtoul(end + 1, &end, 10);
+				}
+				if (*end == '\0' && id < 1000000000UL && stop_mm >= 10 && stop_mm <= 400) {
+					station_command = id;
+					int64_t now = k_uptime_get();
+					if (line[0] == 'S') {
+						run_until_ms = 0;
+						jog_until_ms = 0;
+						station_trip_mm = 0;
+					} else if (line[0] == 'J' && now >= run_until_ms && !jog_until_ms) {
+						jog_start_pulses = (uint32_t)atomic_get(&encoder_count);
+						jog_until_ms = now + STATION_JOG_TIMEOUT_MS;
+					} else if (line[0] == 'R' && !station_trip_mm && !jog_until_ms) {
+						station_stop_mm = (int)stop_mm;
+						run_until_ms = now + 1200;
+					}
+				}
+			}
+			length = 0;
+			overflow = false;
+		} else if (length < sizeof(line) - 1) {
+			line[length++] = ch;
+		} else {
+			overflow = true;
+		}
+	}
+}
+#endif
+
 #ifdef UNOQ_SPEED_PI
 #define SPEED_MIN_RPM 105
 #define SPEED_MAX_RPM 120
@@ -368,8 +449,13 @@ static void update_motor_speed(struct k_work *work)
 	static int last_duty;
 #ifdef UNOQ_CONVEYOR
 	static bool knob_zero_seen;
+#ifndef UNOQ_SORT_STATION
 	static int64_t next_status_ms;
+#endif
 	int distance_mm;
+#endif
+#ifdef UNOQ_SORT_STATION
+	read_station_commands();
 #endif
 	int32_t voltage_mv;
 	int ret = read_knob_mv(&voltage_mv);
@@ -381,7 +467,28 @@ static void update_motor_speed(struct k_work *work)
 
 	int duty = 0;
 #ifdef UNOQ_CONVEYOR
+#ifdef UNOQ_SORT_STATION
+	int64_t now = k_uptime_get();
+	bool jog_cycle = jog_until_ms != 0;
+	if (jog_until_ms && (now >= jog_until_ms || voltage_mv <= POT_STOP_MV ||
+	    (uint32_t)atomic_get(&encoder_count) != jog_start_pulses)) {
+		jog_until_ms = 0;
+	}
+	bool jogging = jog_until_ms != 0;
+	bool seeking = now < run_until_ms;
+	distance_mm = -1;
+	if (seeking) {
+		conveyor_path_is_clear(&distance_mm);
+		if (distance_mm > 0 && distance_mm < station_stop_mm) {
+			station_trip_mm = distance_mm;
+			run_until_ms = 0;
+		}
+	}
+	bool path_clear = k_uptime_get() < run_until_ms;
+	bool run_allowed = path_clear || jogging;
+#else
 	bool path_clear = conveyor_path_is_clear(&distance_mm);
+#endif
 	if (!knob_zero_seen && voltage_mv <= POT_STOP_MV) {
 		knob_zero_seen = true;
 		printk("Speed knob at zero. Conveyor ready.\n");
@@ -425,6 +532,15 @@ static void update_motor_speed(struct k_work *work)
 	}
 #endif
 
+#ifdef UNOQ_SORT_STATION
+	bool jog_motor_ready = knob_zero_seen && voltage_mv > POT_STOP_MV;
+#ifdef UNOQ_SPEED_PI
+	jog_motor_ready = jog_motor_ready && !speed_pi.encoder_fault;
+#endif
+	if (jogging && jog_motor_ready) {
+		duty = STATION_JOG_DUTY;
+	}
+#endif
 	if (duty != last_duty) {
 		ret = pwm_set_pulse_dt(&motor_enable, motor_enable.period * duty / 100U);
 		if (ret < 0) {
@@ -437,6 +553,15 @@ static void update_motor_speed(struct k_work *work)
 	}
 
 #ifdef UNOQ_CONVEYOR
+#ifdef UNOQ_SORT_STATION
+	if (station_trip_mm) {
+		distance_mm = station_trip_mm;
+	} else if (!seeking && !jog_cycle) {
+		conveyor_path_is_clear(&distance_mm);
+	}
+	printk("SORT %u %d %d %u %u\n", station_command, distance_mm, duty,
+	       (unsigned int)atomic_get(&encoder_count), (unsigned int)run_allowed);
+#else
 	int64_t now = k_uptime_get();
 	if (now >= next_status_ms) {
 #ifdef UNOQ_SPEED_PI
@@ -449,7 +574,12 @@ static void update_motor_speed(struct k_work *work)
 		next_status_ms = now + 1000;
 	}
 #endif
+#endif
+#ifdef UNOQ_SORT_STATION
+	k_work_schedule(k_work_delayable_from_work(work), K_MSEC(jogging ? 15 : 100));
+#else
 	k_work_schedule(k_work_delayable_from_work(work), K_MSEC(100));
+#endif
 }
 #endif
 
@@ -507,7 +637,17 @@ static void motor_test_start(void)
 #endif
 	printk("Conveyor speed knob ready. PWM at %u Hz.\n",
 	       NSEC_PER_SEC / motor_enable.period);
+#ifdef UNOQ_SORT_STATION
+	if (!device_is_ready(station_uart) ||
+	    uart_irq_callback_user_data_set(station_uart, station_uart_rx, NULL) < 0) {
+		printk("Sorting UART setup failed. Motor stopped.\n");
+		return;
+	}
+	uart_irq_rx_enable(station_uart);
+	printk("Sorting mode. Conveyor waits for the PC controller.\n");
+#else
 	printk("Conveyor stops for readings below %d mm.\n", OBJECT_STOP_MM);
+#endif
 	k_work_schedule(&speed_work, K_NO_WAIT);
 #endif
 }

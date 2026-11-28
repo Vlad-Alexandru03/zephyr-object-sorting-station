@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qbot camera</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; }
+  main { max-width: 38rem; margin: auto; padding: 1.5rem 1rem; }
+  h1 { margin: 0 0 1rem; font-size: 1.8rem; }
+  .actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+  button, select { min-height: 48px; padding: .65rem 1rem; border-radius: .55rem; font: inherit; }
+  #camera-options { margin-top: .75rem; }
+  select { max-width: 100%; }
+  #take { background: #165d56; color: white; border: 1px solid transparent; }
+  button:disabled { opacity: .6; }
+  video, img { display: block; max-width: 100%; height: auto; border-radius: .6rem; }
+  [hidden] { display: none; }
+  video { margin-top: 1rem; }
+</style>
+<main>
+  <h1>Qbot camera</h1>
+  <div class="actions">
+    <button type="button" id="live">Start live camera</button>
+    <button type="button" id="take">Take photo</button>
+    <button type="button" id="choose">Choose from gallery</button>
+  </div>
+  <input type="file" id="camera" accept="image/*" capture="environment" hidden>
+  <input type="file" id="gallery" accept="image/*" hidden>
+  <div id="camera-options" hidden>
+    <label for="camera-device">Camera</label>
+    <select id="camera-device"><option value="">Automatic rear camera</option></select>
+  </div>
+  <video id="preview" aria-label="Live camera preview" autoplay muted playsinline hidden></video>
+  <p id="status" role="status"></p>
+  <img id="result" alt="Photo with object detection labels" hidden>
+</main>
+<script>
+  const camera = document.querySelector('#camera');
+  const gallery = document.querySelector('#gallery');
+  const take = document.querySelector('#take');
+  const choose = document.querySelector('#choose');
+  const live = document.querySelector('#live');
+  const cameraOptions = document.querySelector('#camera-options');
+  const cameraDevice = document.querySelector('#camera-device');
+  const preview = document.querySelector('#preview');
+  const status = document.querySelector('#status');
+  const result = document.querySelector('#result');
+  const frameIntervalMs = 400;
+  let resultUrl;
+  let stream;
+  let timer;
+  let busy = false;
+
+  take.addEventListener('click', () => camera.click());
+  choose.addEventListener('click', () => gallery.click());
+  camera.addEventListener('change', upload);
+  gallery.addEventListener('change', upload);
+  live.addEventListener('click', toggleLive);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && stream) stopLive();
+  });
+
+  async function makeJpeg(source, width, height, quality = .88) {
+    const scale = Math.min(1, 1280 / Math.max(width, height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    canvas.getContext('2d', {alpha: false}).drawImage(source, 0, 0, canvas.width, canvas.height);
+    for (const compressionQuality of [quality, .68]) {
+      const jpeg = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', compressionQuality));
+      if (jpeg?.size > 0 && jpeg.size <= 1024 * 1024) return jpeg;
+    }
+    throw new Error('Could not make a JPEG under 1 MiB.');
+  }
+
+  async function readPhoto(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const photo = new Image();
+      photo.src = url;
+      try {
+        await photo.decode();
+      } catch {
+        throw new Error('Could not open this photo. Try a JPEG from your gallery.');
+      }
+      return await makeJpeg(photo, photo.naturalWidth, photo.naturalHeight);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  async function postCapture(jpeg, timeoutMs) {
+    const capture = await fetch('/capture', {
+      method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: jpeg,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!capture.ok) throw new Error(`Qbot rejected the photo (${capture.status} ${capture.statusText}).`);
+    return capture.json();
+  }
+
+  function detectionMessage(detections) {
+    return `${detections} ${detections === 1 ? 'object' : 'objects'} detected.`;
+  }
+
+  async function sendPhoto(jpeg) {
+    const {detections, image} = await postCapture(jpeg, 30000);
+    const annotated = await fetch(image, {cache: 'no-store', signal: AbortSignal.timeout(10000)});
+    if (!annotated.ok) throw new Error('The photo was processed, but the result could not be loaded.');
+    if (resultUrl) URL.revokeObjectURL(resultUrl);
+    resultUrl = URL.createObjectURL(await annotated.blob());
+    result.src = resultUrl;
+    result.hidden = false;
+    return detectionMessage(detections);
+  }
+
+  function stopLive(message = 'Live camera stopped.') {
+    clearTimeout(timer);
+    stream?.getTracks().forEach(track => track.stop());
+    stream = null;
+    preview.srcObject = null;
+    preview.hidden = true;
+    live.textContent = 'Start live camera';
+    live.disabled = take.disabled = choose.disabled = busy;
+    cameraDevice.disabled = busy;
+    status.textContent = message;
+  }
+
+  async function uploadFrame(activeStream) {
+    if (stream !== activeStream) return;
+    const started = performance.now();
+    let uploadFailed = false;
+    if (preview.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      busy = true;
+      try {
+        const jpeg = await makeJpeg(preview, preview.videoWidth, preview.videoHeight, .78);
+        if (stream !== activeStream) return;
+        const {detections} = await postCapture(jpeg, 12000);
+        if (stream === activeStream) {
+          status.textContent = detectionMessage(detections);
+        }
+      } catch (error) {
+        if (stream === activeStream) {
+          uploadFailed = true;
+          status.textContent = `Camera upload interrupted. Retrying (${error.message})`;
+        }
+      } finally {
+        busy = false;
+        if (!stream) live.disabled = take.disabled = choose.disabled = cameraDevice.disabled = false;
+      }
+    }
+    if (stream === activeStream) {
+      const delay = uploadFailed ? 1000 : Math.max(100, frameIntervalMs - (performance.now() - started));
+      timer = setTimeout(() => uploadFrame(activeStream), delay);
+    }
+  }
+
+  async function listCameras(track) {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter(device => device.kind === 'videoinput' && device.deviceId);
+      cameraDevice.replaceChildren(new Option('Automatic rear camera', ''));
+      cameras.forEach((device, index) => {
+        cameraDevice.add(new Option(device.label || `Camera ${index + 1}`, device.deviceId));
+      });
+      const activeId = track.getSettings().deviceId;
+      if (cameras.some(device => device.deviceId === activeId)) cameraDevice.value = activeId;
+      cameraOptions.hidden = cameras.length === 0;
+    } catch {
+      // A browser can allow the stream without exposing alternate cameras.
+    }
+  }
+
+  async function toggleLive() {
+    if (stream) {
+      stopLive();
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      status.textContent = 'Open this page over HTTPS or through the phone’s local connection for live camera access.';
+      return;
+    }
+    live.disabled = take.disabled = choose.disabled = cameraDevice.disabled = true;
+    status.textContent = 'Opening camera…';
+    try {
+      const choice = cameraDevice.value;
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          ...(choice ? {deviceId: {exact: choice}} : {facingMode: {ideal: 'environment'}}),
+          width: {ideal: 1280},
+          height: {ideal: 960},
+        },
+      });
+      if (document.hidden) {
+        stopLive();
+        return;
+      }
+      preview.srcObject = stream;
+      preview.hidden = false;
+      result.hidden = true;
+      await preview.play();
+      if (!stream) return;
+      const track = stream.getVideoTracks()[0];
+      track.addEventListener('ended', () => stopLive('The camera disconnected.'));
+      await listCameras(track);
+      if (!stream) return;
+      live.textContent = 'Stop live camera';
+      live.disabled = false;
+      status.textContent = 'Uploading frames automatically…';
+      uploadFrame(stream);
+    } catch (error) {
+      stopLive(error.message);
+    }
+  }
+
+  async function upload(event) {
+    const input = event.currentTarget;
+    const file = input.files[0];
+    input.value = '';
+    if (!file) return;
+    live.disabled = take.disabled = choose.disabled = true;
+    result.hidden = true;
+    status.textContent = 'Preparing photo…';
+    try {
+      const jpeg = await readPhoto(file);
+      status.textContent = 'Sending photo to Qbot for detection…';
+      status.textContent = await sendPhoto(jpeg);
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      live.disabled = take.disabled = choose.disabled = false;
+    }
+  }
+</script>
+</html>

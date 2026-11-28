@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object sorting station</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf8;
+  --panel: #f2f0ec;
+  --ink: #1c1b19;
+  --muted: #6f6b64;
+  --line: #e0ddd7;
+  --accent: #2f6b4f;
+  --bad: #a5382c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151413;
+    --panel: #1e1d1b;
+    --ink: #f1efeb;
+    --muted: #918c84;
+    --line: #2f2d2a;
+    --accent: #74b492;
+    --bad: #e08b7f;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+main { max-width: 680px; margin: 0 auto; padding: 40px 24px 64px; }
+
+h1 {
+  margin: 0 0 24px;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.state { margin: 0 0 20px; font-size: 16px; }
+.state strong { font-weight: 600; }
+.state[data-kind="running"] strong { color: var(--accent); }
+.state[data-kind="failed"] strong { color: var(--bad); }
+.state span { color: var(--muted); }
+
+.actions { display: flex; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+button {
+  font: inherit;
+  font-weight: 600;
+  min-height: 46px;
+  padding: 0 26px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+  transition: background-color .15s ease, border-color .15s ease, opacity .15s ease;
+}
+button:hover:not(:disabled) { border-color: var(--muted); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .45; cursor: default; }
+#start { border-color: var(--accent); color: var(--accent); }
+#stop { color: var(--bad); border-color: var(--bad); }
+
+.message { margin: 0 0 24px; color: var(--muted); font-size: 14px; min-height: 1.55em; }
+.message[data-kind="failed"] { color: var(--bad); }
+
+section { margin-bottom: 28px; }
+h2 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+.link { margin: 0; font-size: 15px; }
+.link a { color: var(--accent); text-decoration: none; }
+.link a:hover { text-decoration: underline; }
+.link a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.link[data-live="false"] a { color: var(--muted); pointer-events: none; }
+
+details { border-top: 1px solid var(--line); padding-top: 10px; }
+summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+}
+summary::marker, summary::-webkit-details-marker { display: none; }
+summary::before { content: "▸ "; }
+details[open] summary::before { content: "▾ "; }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+pre {
+  margin: 10px 0 0;
+  padding: 12px;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--panel);
+  border-radius: 6px;
+  font: 12.5px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre:empty::after { content: "Nothing yet."; color: var(--muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  button { transition: none; }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>Object sorting station</h1>
+
+  <p class="state" id="state" data-kind="idle"><strong id="state-word">Stopped</strong> <span id="state-detail"></span></p>
+
+  <div class="actions">
+    <button type="button" id="start">Start</button>
+    <button type="button" id="stop" disabled>Stop</button>
+  </div>
+
+  <p class="message" id="message" role="status" aria-live="polite"></p>
+
+  <section>
+    <h2>Live view</h2>
+    <p class="link" id="live" data-live="false">
+      <a href="http://127.0.0.1:8767/" target="_blank" rel="noopener">http://127.0.0.1:8767/</a>
+    </p>
+  </section>
+
+  <section>
+    <details>
+      <summary>Recent output</summary>
+      <pre id="log">Nothing yet.</pre>
+    </details>
+  </section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+let busy = false;
+
+function describe(s) {
+  el('start').disabled = busy || s.running;
+  el('stop').disabled = busy || !s.running;
+
+  const state = el('state');
+  const word = el('state-word');
+  const detail = el('state-detail');
+  const live = el('live');
+
+  if (s.running) {
+    state.dataset.kind = 'running';
+    word.textContent = 'Running';
+    detail.textContent = s.uptime_s == null ? '' : `· ${Math.round(s.uptime_s)} s`;
+    live.dataset.live = 'true';
+  } else if (s.stopped_by_user) {
+    state.dataset.kind = 'idle';
+    word.textContent = 'Stopped';
+    detail.textContent = '';
+    live.dataset.live = 'false';
+  } else if (s.exit_code === 0) {
+    state.dataset.kind = 'idle';
+    word.textContent = 'Finished';
+    detail.textContent = '';
+    live.dataset.live = 'false';
+  } else if (s.exit_code == null) {
+    state.dataset.kind = 'idle';
+    word.textContent = 'Stopped';
+    detail.textContent = '';
+    live.dataset.live = 'false';
+  } else {
+    state.dataset.kind = 'failed';
+    word.textContent = 'Something went wrong';
+    detail.textContent = `· exit code ${s.exit_code}`;
+    live.dataset.live = 'false';
+  }
+
+  const log = el('log');
+  const text = (s.log || []).join('\n');
+  if (log.textContent !== text) log.textContent = text;
+}
+
+async function refresh() {
+  try {
+    const response = await fetch('/status.json', {cache: 'no-store', signal: AbortSignal.timeout(1500)});
+    if (!response.ok) throw Error(response.status);
+    describe(await response.json());
+  } catch {
+    const message = el('message');
+    message.textContent = 'Lost contact with the launcher. Is it still open in a terminal?';
+    message.dataset.kind = 'failed';
+  }
+}
+
+async function act(path) {
+  if (busy) return;
+  busy = true;
+  el('start').disabled = true;
+  el('stop').disabled = true;
+  const message = el('message');
+  message.dataset.kind = '';
+  message.textContent = path === '/start' ? 'Starting…' : 'Stopping…';
+  try {
+    const response = await fetch(path, {method: 'POST', signal: AbortSignal.timeout(30000)});
+    const result = await response.json();
+    message.textContent = result.message || '';
+    message.dataset.kind = result.ok ? '' : 'failed';
+    describe(result);
+  } catch {
+    message.textContent = 'The launcher did not answer. Check its terminal.';
+    message.dataset.kind = 'failed';
+  } finally {
+    busy = false;
+    refresh();
+  }
+}
+
+el('start').addEventListener('click', () => act('/start'));
+el('stop').addEventListener('click', () => act('/stop'));
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

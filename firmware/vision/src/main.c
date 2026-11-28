@@ -239,6 +239,10 @@ static int capture_frames(const struct device *camera, size_t size,
     return 0;
 }
 
+#ifdef MOTOR_TEST_ON_BOOT
+void motor_test_start(void);
+#endif
+
 int main(void)
 {
     const struct device *camera = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
@@ -285,6 +289,10 @@ int main(void)
 
     printk("JPEG mode %u x %u, buffer capacity %u bytes in PSRAM\n",
            fmt.width, fmt.height, fmt.size);
+
+#ifdef MOTOR_TEST_ON_BOOT
+    motor_test_start();
+#endif
 
     for (;;) {
         printk("Ready. Press BOOT to take a picture.\n");

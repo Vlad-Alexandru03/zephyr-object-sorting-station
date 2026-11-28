@@ -13,7 +13,7 @@
 	zephyr,user {
 		pwms = <&ledc0 0 PWM_HZ(1000) PWM_POLARITY_NORMAL>;
 		io-channels = <&adc0 1>;
-		in3-gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+		in3-gpios = <&gpio1 6 GPIO_ACTIVE_HIGH>;
 		in4-gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
 		encoder-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
 	};

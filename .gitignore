@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.arm-venv/
+.vision-venv/
+build*/
+local/
+models/
+runs/
+datasets/
+*.pt
+*.log
+scratch/

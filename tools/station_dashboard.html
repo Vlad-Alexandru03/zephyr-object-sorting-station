@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object sorting station</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf8;
+  --panel: #f2f0ec;
+  --ink: #1c1b19;
+  --muted: #6f6b64;
+  --line: #e0ddd7;
+  --accent: #2f6b4f;
+  --bad: #a5382c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151413;
+    --panel: #1e1d1b;
+    --ink: #f1efeb;
+    --muted: #918c84;
+    --line: #2f2d2a;
+    --accent: #74b492;
+    --bad: #e08b7f;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+main { max-width: 680px; margin: 0 auto; padding: 40px 24px 64px; }
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.now { margin-bottom: 32px; }
+.steps {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+.steps li {
+  padding-top: 9px;
+  border-top: 2px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+  transition: border-color .2s ease, color .2s ease;
+}
+.steps li[aria-current="step"] {
+  border-color: var(--accent);
+  color: var(--ink);
+  font-weight: 600;
+}
+.detail { margin: 0; color: var(--muted); font-size: 14px; min-height: 1.55em; }
+.detail[data-phase="fault"] { color: var(--bad); font-weight: 500; }
+
+section { margin-bottom: 32px; }
+h2 {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+.head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-bottom: 12px; }
+.head h2 { margin: 0; }
+.label { color: var(--muted); font-size: 13px; }
+
+.shot {
+  display: block;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  object-fit: contain;
+}
+.empty {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+  padding: 16px;
+}
+[hidden] { display: none !important; }
+
+.speed { font-size: 40px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.speed-unit { color: var(--muted); font-size: 15px; font-weight: 400; margin-left: 4px; }
+.speed-state { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
+
+.dest { margin: 0; font-size: 16px; }
+.dest.idle { color: var(--muted); }
+
+.activity { margin: 0; padding: 0; list-style: none; }
+.activity li {
+  display: flex;
+  gap: 14px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+  font-size: 14px;
+}
+.activity li:first-child { border-top: 0; }
+.activity time {
+  min-width: 54px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  padding-top: 1px;
+}
+.activity p { margin: 0; }
+
+@media (max-width: 430px) {
+  main { padding: 28px 18px 48px; }
+  .steps { gap: 6px; }
+  .steps li { font-size: 12px; }
+  .speed { font-size: 32px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .steps li { transition: none; }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>Object sorting station</h1>
+
+  <div class="now">
+    <ol class="steps" aria-label="Sorting steps">
+      <li data-step="seek">Conveyor</li>
+      <li data-step="inspect">Vision check</li>
+      <li data-step="jog">Alignment</li>
+      <li data-step="arm">Pick &amp; place</li>
+    </ol>
+    <p class="detail" id="detail" aria-live="polite">Waiting for the sorter to start.</p>
+  </div>
+
+  <section>
+    <div class="head">
+      <h2>Inspection snapshot</h2>
+      <span class="label" id="object"></span>
+    </div>
+    <div class="empty" id="shot-empty">No snapshot yet.</div>
+    <img class="shot" id="shot" alt="The frame the station used to inspect the item" hidden>
+  </section>
+
+  <section>
+    <h2>Conveyor speed</h2>
+    <div><span class="speed" id="speed">—</span><span class="speed-unit" id="speed-unit">RPM</span></div>
+    <p class="speed-state" id="speed-state">No readings yet</p>
+  </section>
+
+  <section>
+    <h2>Destination</h2>
+    <p class="dest idle" id="destination">Not chosen yet</p>
+  </section>
+
+  <section>
+    <h2>Activity</h2>
+    <ol class="activity" id="events">
+      <li><time>—</time><p>Nothing has happened yet.</p></li>
+    </ol>
+  </section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const steps = document.querySelectorAll('[data-step]');
+let frameId = null, eventsKey = '';
+
+function render(s) {
+  const detail = el('detail');
+  detail.textContent = s.detail || s.title || '';
+  detail.dataset.phase = s.phase || '';
+
+  for (const step of steps) {
+    if (step.dataset.step === s.phase) step.setAttribute('aria-current', 'step');
+    else step.removeAttribute('aria-current');
+  }
+
+  if (s.frame_id !== frameId) {
+    frameId = s.frame_id;
+    el('shot').hidden = frameId == null;
+    el('shot-empty').hidden = frameId != null;
+    if (frameId != null) el('shot').src = `/frame.jpg?v=${frameId}`;
+  }
+  el('object').textContent = s.object
+    ? `${s.object.label} ${Math.round(s.object.confidence * 100)}%`
+    : '';
+
+  const belt = s.belt;
+  const fresh = belt && belt.age_s < 2;
+  const linear = belt && belt.mm_per_s != null;
+  const speed = fresh ? (linear ? belt.mm_per_s : belt.rpm) : null;
+  el('speed').textContent = speed == null ? '—' : speed.toFixed(1);
+  el('speed-unit').textContent = linear ? 'mm/s' : 'RPM';
+  el('speed-state').textContent = !belt ? 'No readings yet'
+    : !fresh ? 'Not updating'
+    : belt.running ? 'Running'
+    : belt.rpm > 0.5 ? 'Coasting'
+    : 'Stopped';
+
+  const destination = el('destination');
+  destination.textContent = s.destination || 'Not chosen yet';
+  destination.classList.toggle('idle', !s.destination);
+
+  const key = JSON.stringify(s.events);
+  if (key !== eventsKey) {
+    eventsKey = key;
+    const items = s.events.slice(-6).reverse().map(event => {
+      const li = document.createElement('li');
+      const time = document.createElement('time');
+      const text = document.createElement('p');
+      time.textContent = `${event.at.toFixed(1)} s`;
+      text.textContent = event.title;
+      li.append(time, text);
+      return li;
+    });
+    el('events').replaceChildren(...items);
+  }
+}
+
+async function poll() {
+  try {
+    const response = await fetch('/state.json', {cache: 'no-store', signal: AbortSignal.timeout(1500)});
+    if (!response.ok) throw Error(response.status);
+    render(await response.json());
+  } catch {
+    const detail = el('detail');
+    detail.textContent = 'Waiting for the sorter.';
+    detail.dataset.phase = '';
+  }
+  setTimeout(poll, 250);
+}
+
+poll();
+</script>
+</body>
+</html>
