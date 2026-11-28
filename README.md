@@ -6,9 +6,10 @@ A phone sends snapshots to a second UNO Q (Qbot), which runs YOLO on Debian.
 The PC stops the conveyor when both sensors see an item at the pickup spot,
 then routes the item to its bin using taught SO-101 poses.
 
+https://github.com/user-attachments/assets/12c19b4e-089d-445a-a503-6fe338bee8bd
+
 A full cycle, from the belt stopping to the part landing in its bin, is in
-[docs/demo.mp4](docs/demo.mp4) (93 s). GitHub plays it in the browser when you
-open the file.
+[docs/demo.mp4](docs/demo.mp4) (93 s) as well.
 
 [Set up and run fixed-position sorting](docs/fixed-position-sorting.md).
 Use `--ultrasonic-only` to stop the conveyor on ultrasound and let the camera
